@@ -1,0 +1,7 @@
+config_local.py
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+.env
