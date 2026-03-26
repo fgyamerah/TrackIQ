@@ -1,7 +1,20 @@
 config_local.py
-__pycache__/
-*.pyc
 *.pyo
-.venv/
 *.egg-info/
 .env
+
+# music files
+*.mp3
+*.wav
+*.flac
+*.aiff
+
+# large data
+data/
+cache/
+.cache/
+
+# python
+__pycache__/
+*.pyc
+.venv/
