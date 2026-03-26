@@ -33,6 +33,64 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Energy classification
+# ---------------------------------------------------------------------------
+# Genres that always map to Peak regardless of BPM
+_PEAK_GENRES: frozenset = frozenset({
+    "afro tech", "techno", "hard techno", "industrial techno",
+    "peak time techno", "rave",
+})
+# Genres that always map to Chill regardless of BPM
+_CHILL_GENRES: frozenset = frozenset({
+    "deep house", "organic house", "melodic house", "melodic techno",
+    "downtempo", "ambient", "lo-fi", "nu-disco",
+})
+# BPM thresholds
+_BPM_PEAK  = 126.0
+_BPM_MID   = 118.0
+
+# Target genres for combined playlists: (lowercase match key, display name)
+_COMBINED_TARGET_GENRES: list = [
+    ("afro house",  "Afro House"),
+    ("amapiano",    "Amapiano"),
+    ("deep house",  "Deep House"),
+    ("afro tech",   "Afro Tech"),
+]
+_ENERGY_LEVELS = ("Peak", "Mid", "Chill")
+
+
+def _classify_energy(bpm, genre: str) -> str:
+    """
+    Return the energy tier for a track: 'Peak', 'Mid', or 'Chill'.
+
+    Genre classification takes priority over BPM so that e.g. Afro Tech is
+    always Peak even when a specific track sits at a lower BPM than usual.
+    Unknown BPM with no genre signal defaults to 'Mid'.
+    """
+    genre_l = (genre or "").strip().lower()
+
+    for g in _PEAK_GENRES:
+        if g in genre_l:
+            return "Peak"
+    for g in _CHILL_GENRES:
+        if g in genre_l:
+            return "Chill"
+
+    try:
+        bpm_val = float(bpm or 0)
+    except (TypeError, ValueError):
+        bpm_val = 0.0
+
+    if bpm_val >= _BPM_PEAK:
+        return "Peak"
+    if bpm_val >= _BPM_MID:
+        return "Mid"
+    if bpm_val > 0:
+        return "Chill"
+    return "Mid"
+
+
+# ---------------------------------------------------------------------------
 # Genre normalization
 # ---------------------------------------------------------------------------
 _RE_GENRE_SPLIT = re.compile(r'[,;/|]')
@@ -200,6 +258,91 @@ def generate_genre_m3u(dry_run: bool = False) -> int:
     return total
 
 
+def generate_energy_m3u(dry_run: bool = False) -> int:
+    """
+    Generate Peak / Mid / Chill M3U playlists from all 'ok' tracks.
+
+    Classification is based on BPM and genre (see _classify_energy).
+    Writes to ENERGY_M3U_DIR (<M3U_DIR>/Energy/).
+    Returns total tracks written across all three energy playlists.
+    """
+    if not getattr(config, 'GENERATE_ENERGY_PLAYLISTS', True):
+        log.info("Energy M3U: disabled via GENERATE_ENERGY_PLAYLISTS=False")
+        return 0
+
+    all_tracks = db.get_all_ok_tracks()
+    if not all_tracks:
+        log.info("Energy M3U: no tracks with status=ok in DB")
+        return 0
+
+    by_energy: dict = {level: [] for level in _ENERGY_LEVELS}
+    for row in all_tracks:
+        level = _classify_energy(row["bpm"], row["genre"])
+        by_energy[level].append(row)
+
+    total = 0
+    written_playlists = 0
+    for level in _ENERGY_LEVELS:
+        tracks = by_energy[level]
+        if not tracks:
+            continue
+        playlist_path = config.ENERGY_M3U_DIR / f"{level}.m3u8"
+        n = _write_m3u(playlist_path, tracks, dry_run)
+        total += n
+        written_playlists += 1
+        log.debug("Energy M3U '%s': %d tracks", level, n)
+
+    log.info("Energy M3U: wrote %d energy playlists (%d tracks)", written_playlists, total)
+    log_action(f"PLAYLIST: {written_playlists} energy M3U playlists (Peak/Mid/Chill) ({total} tracks)")
+    return total
+
+
+def generate_combined_m3u(dry_run: bool = False) -> int:
+    """
+    Generate combined genre+energy M3U playlists for the four target genres
+    (Afro House, Amapiano, Deep House, Afro Tech) × three energy tiers.
+
+    Only playlists that contain at least one track are written.
+    Writes to COMBINED_M3U_DIR (<M3U_DIR>/Combined/).
+    Returns total tracks written across all combined playlists.
+    """
+    if not getattr(config, 'GENERATE_COMBINED_PLAYLISTS', True):
+        log.info("Combined M3U: disabled via GENERATE_COMBINED_PLAYLISTS=False")
+        return 0
+
+    all_tracks = db.get_all_ok_tracks()
+    if not all_tracks:
+        log.info("Combined M3U: no tracks with status=ok in DB")
+        return 0
+
+    # Build index: (genre_display, energy) → [rows]
+    combined: dict = {}
+    for row in all_tracks:
+        norm_g = normalize_genre(row["genre"]).lower()
+        energy = _classify_energy(row["bpm"], row["genre"])
+        for genre_key, genre_display in _COMBINED_TARGET_GENRES:
+            if norm_g == genre_key or norm_g.startswith(genre_key):
+                combined.setdefault((genre_display, energy), []).append(row)
+                break  # each track belongs to at most one target genre
+
+    total = 0
+    written_playlists = 0
+    for (genre_display, energy), tracks in sorted(combined.items()):
+        if not tracks:
+            continue
+        name      = f"{energy} {genre_display}"
+        safe_name = _genre_filename(name)
+        playlist_path = config.COMBINED_M3U_DIR / f"{safe_name}.m3u8"
+        n = _write_m3u(playlist_path, tracks, dry_run)
+        total += n
+        written_playlists += 1
+        log.debug("Combined M3U '%s': %d tracks", name, n)
+
+    log.info("Combined M3U: wrote %d combined playlists (%d tracks)", written_playlists, total)
+    log_action(f"PLAYLIST: {written_playlists} combined genre+energy M3U playlists ({total} tracks)")
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Rekordbox XML generation
 # ---------------------------------------------------------------------------
@@ -230,6 +373,15 @@ def _added_date() -> str:
 def generate_rekordbox_xml(dry_run: bool = False) -> Path:
     """
     Generate a Rekordbox-importable XML file from all 'ok' tracks.
+
+    Playlist hierarchy:
+      ROOT
+        ├── All Tracks
+        ├── A … Z  (letter folders)
+        ├── Genre/  (one sub-node per genre)
+        ├── Energy/ (Peak / Mid / Chill sub-nodes)
+        └── Combined/ (genre+energy sub-nodes, e.g. "Peak Afro House")
+
     Returns the path of the written XML file.
     """
     all_tracks = db.get_all_ok_tracks()
@@ -241,10 +393,11 @@ def generate_rekordbox_xml(dry_run: bool = False) -> Path:
 
     config.XML_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Build track entries; collect groupings for letter and genre playlist nodes
-    track_entries: List[str] = []
-    playlist_nodes: dict = {}   # letter  → [TrackID, ...]
-    genre_nodes:    dict = {}   # genre   → [TrackID, ...]
+    track_entries:  List[str] = []
+    playlist_nodes: dict = {}   # letter            → [TrackID, ...]
+    genre_nodes:    dict = {}   # genre display name → [TrackID, ...]
+    energy_nodes:   dict = {}   # energy tier        → [TrackID, ...]
+    combined_nodes: dict = {}   # (genre_display, energy) → [TrackID, ...]
     track_id = 1
 
     for row in all_tracks:
@@ -252,7 +405,6 @@ def generate_rekordbox_xml(dry_run: bool = False) -> Path:
         win_url    = _xml_escape(_linux_to_windows_url(linux_path))
         name       = _xml_escape(row["title"]  or Path(linux_path).stem)
         artist     = _xml_escape(row["artist"] or "")
-        # Use normalized genre for display so XML matches M3U genre names
         raw_genre  = row["genre"] or ""
         norm_genre = normalize_genre(raw_genre)
         genre_attr = _xml_escape(norm_genre or raw_genre)
@@ -263,6 +415,7 @@ def generate_rekordbox_xml(dry_run: bool = False) -> Path:
         bitrate    = str(row["bitrate_kbps"] or 0)
         kind       = _kind_from_path(linux_path)
         size       = str(row["filesize_bytes"] or 0)
+        label      = _xml_escape(_read_label_from_file(linux_path))
 
         track_entries.append(
             f'        <TRACK TrackID="{track_id}"'
@@ -288,12 +441,12 @@ def generate_rekordbox_xml(dry_run: bool = False) -> Path:
             f' Location="{win_url}"'
             f' Remixer=""'
             f' Tonality="{key}"'
-            f' Label=""'
+            f' Label="{label}"'
             f' Mix="">'
             f'</TRACK>'
         )
 
-        # Group by first letter for letter playlists
+        # Letter grouping
         try:
             rel    = Path(linux_path).relative_to(config.SORTED)
             letter = rel.parts[0] if rel.parts else "#"
@@ -301,83 +454,162 @@ def generate_rekordbox_xml(dry_run: bool = False) -> Path:
             letter = "#"
         playlist_nodes.setdefault(letter, []).append(track_id)
 
-        # Group by normalized genre for genre playlists
+        # Genre grouping
         if norm_genre:
             genre_nodes.setdefault(norm_genre, []).append(track_id)
+
+        # Energy grouping
+        energy = _classify_energy(row["bpm"], raw_genre)
+        energy_nodes.setdefault(energy, []).append(track_id)
+
+        # Combined genre+energy grouping (target genres only)
+        norm_genre_l = norm_genre.lower()
+        for genre_key, genre_display in _COMBINED_TARGET_GENRES:
+            if norm_genre_l == genre_key or norm_genre_l.startswith(genre_key):
+                combined_nodes.setdefault((genre_display, energy), []).append(track_id)
+                break
 
         track_id += 1
 
     collection_count = track_id - 1
 
-    # --- Letter playlist XML nodes ---
-    playlist_xml_parts: List[str] = []
-    for letter, tids in sorted(playlist_nodes.items()):
-        track_refs = "\n".join(
-            f'                    <TRACK Key="{tid}"/>' for tid in tids
+    # --- Helper: build a leaf (Type=1) playlist node ---
+    def _leaf_node(name: str, tids: list, indent: str) -> str:
+        refs = "\n".join(f'{indent}    <TRACK Key="{t}"/>' for t in tids)
+        return (
+            f'{indent}<NODE Name="{_xml_escape(name)}" Type="1"'
+            f' KeyType="0" Entries="{len(tids)}">\n'
+            f'{refs}\n'
+            f'{indent}</NODE>'
         )
-        playlist_xml_parts.append(
-            f'            <NODE Name="{_xml_escape(letter)}" Type="1" KeyType="0" Entries="{len(tids)}">\n'
-            f'{track_refs}\n'
-            f'            </NODE>'
-        )
+
+    # --- Letter playlist nodes ---
+    playlist_xml_parts: List[str] = [
+        _leaf_node(letter, tids, "            ")
+        for letter, tids in sorted(playlist_nodes.items())
+    ]
 
     # --- All-tracks playlist node ---
     all_refs = "\n".join(
         f'                <TRACK Key="{tid}"/>' for tid in range(1, track_id)
     )
     all_tracks_node = (
-        f'            <NODE Name="All Tracks" Type="1" KeyType="0" Entries="{collection_count}">\n'
+        f'            <NODE Name="All Tracks" Type="1" KeyType="0"'
+        f' Entries="{collection_count}">\n'
         f'{all_refs}\n'
         f'            </NODE>'
     )
 
-    # --- Genre folder node (nested sub-nodes, one per genre) ---
-    genre_sub_parts: List[str] = []
-    for genre_name, tids in sorted(genre_nodes.items()):
-        refs = "\n".join(
-            f'                    <TRACK Key="{tid}"/>' for tid in tids
-        )
-        genre_sub_parts.append(
-            f'                <NODE Name="{_xml_escape(genre_name)}" Type="1" KeyType="0" Entries="{len(tids)}">\n'
-            f'{refs}\n'
-            f'                </NODE>'
-        )
+    # --- Genre folder node ---
+    genre_sub_parts: List[str] = [
+        _leaf_node(gname, tids, "                ")
+        for gname, tids in sorted(genre_nodes.items())
+    ]
     genre_folder_node = (
-        f'            <NODE Type="0" Name="Genre" Count="{len(genre_nodes)}">\n'
+        f'            <NODE Type="0" Name="Genre" Count="{len(genre_sub_parts)}">\n'
         + "\n".join(genre_sub_parts) + "\n"
-        + f'            </NODE>'
+        + '            </NODE>'
     )
 
-    # ROOT count = All Tracks node + letter nodes + Genre folder node
-    root_count = 1 + len(playlist_nodes) + 1
+    # --- Energy folder node ---
+    energy_sub_parts: List[str] = [
+        _leaf_node(level, energy_nodes[level], "                ")
+        for level in _ENERGY_LEVELS
+        if energy_nodes.get(level)
+    ]
+    energy_folder_node = (
+        f'            <NODE Type="0" Name="Energy" Count="{len(energy_sub_parts)}">\n'
+        + "\n".join(energy_sub_parts) + "\n"
+        + '            </NODE>'
+    ) if energy_sub_parts else ""
 
-    xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<DJ_PLAYLISTS Version="1.0.0">
-    <PRODUCT Name="rekordbox" Version="6.0.0" Company="Pioneer DJ"/>
-    <COLLECTION Entries="{collection_count}">
-{chr(10).join(track_entries)}
-    </COLLECTION>
-    <PLAYLISTS>
-        <NODE Type="0" Name="ROOT" Count="{root_count}">
-{all_tracks_node}
-{chr(10).join(playlist_xml_parts)}
-{genre_folder_node}
-        </NODE>
-    </PLAYLISTS>
-</DJ_PLAYLISTS>
-"""
+    # --- Combined folder node ---
+    combined_sub_parts: List[str] = [
+        _leaf_node(f"{energy} {genre_display}", tids, "                ")
+        for (genre_display, energy), tids in sorted(combined_nodes.items())
+        if tids
+    ]
+    combined_folder_node = (
+        f'            <NODE Type="0" Name="Combined" Count="{len(combined_sub_parts)}">\n'
+        + "\n".join(combined_sub_parts) + "\n"
+        + '            </NODE>'
+    ) if combined_sub_parts else ""
+
+    # --- Assemble folder nodes list for ROOT ---
+    extra_folder_nodes = [n for n in [energy_folder_node, combined_folder_node] if n]
+    root_count = 1 + len(playlist_nodes) + 1 + len(extra_folder_nodes)
+
+    playlist_section_parts = (
+        [all_tracks_node]
+        + playlist_xml_parts
+        + [genre_folder_node]
+        + extra_folder_nodes
+    )
+
+    xml_content = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<DJ_PLAYLISTS Version="1.0.0">\n'
+        '    <PRODUCT Name="rekordbox" Version="6.0.0" Company="Pioneer DJ"/>\n'
+        f'    <COLLECTION Entries="{collection_count}">\n'
+        + "\n".join(track_entries) + "\n"
+        + '    </COLLECTION>\n'
+        + '    <PLAYLISTS>\n'
+        + f'        <NODE Type="0" Name="ROOT" Count="{root_count}">\n'
+        + "\n".join(playlist_section_parts) + "\n"
+        + '        </NODE>\n'
+        + '    </PLAYLISTS>\n'
+        + '</DJ_PLAYLISTS>\n'
+    )
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(xml_content)
 
-    log.info("Rekordbox XML: %d tracks written to %s", collection_count, output_path)
-    log_action(f"XML: Rekordbox XML written — {collection_count} tracks, {len(genre_nodes)} genre playlists [{output_path.name}]")
+    extra_counts = (
+        f", {len(energy_sub_parts)} energy"
+        + (f", {len(combined_sub_parts)} combined" if combined_sub_parts else "")
+    )
+    log.info("Rekordbox XML: %d tracks → %s (%d genre%s playlists)",
+             collection_count, output_path, len(genre_nodes), extra_counts)
+    log_action(
+        f"XML: Rekordbox XML written — {collection_count} tracks, "
+        f"{len(genre_nodes)} genre, {len(energy_sub_parts)} energy, "
+        f"{len(combined_sub_parts)} combined [{output_path.name}]"
+    )
     return output_path
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _read_label_from_file(path: str) -> str:
+    """
+    Read the organization/TPUB tag from an audio file and return it as a
+    clean label string.
+
+    Returns empty string on any failure or if the tag looks like a URL /
+    domain watermark (those should have been cleared by the sanitizer, but
+    this provides a safety net for the XML export).
+    """
+    try:
+        from mutagen import File as MFile
+        audio = MFile(path, easy=True)
+        if audio is None:
+            return ""
+        vals = audio.get("organization")
+        if not vals:
+            return ""
+        label = str(vals[0]).strip()
+        # Inline junk filter: reject anything that looks like a URL or domain
+        if not label:
+            return ""
+        if re.search(r'https?://|www\.|\.(?:com|net|org|fm|dj|co|io)\b',
+                     label, re.IGNORECASE):
+            return ""
+        return label
+    except Exception:
+        return ""
+
+
 def _build_comment(row: sqlite3.Row) -> str:
     parts = []
     if row["key_camelot"]:
@@ -408,8 +640,19 @@ def _kind_from_path(path: str) -> str:
 # Public interface
 # ---------------------------------------------------------------------------
 def run(files: List[Path], run_id: int, dry_run: bool = False) -> List[Path]:
-    """Generate M3U playlists (letter + genre) and Rekordbox XML. Returns files unchanged."""
+    """
+    Generate all playlists and Rekordbox XML. Returns files unchanged.
+
+    Outputs:
+      M3U_DIR/           letter playlists (A.m3u8 … Z.m3u8) + _all_tracks.m3u8
+      M3U_DIR/Genre/     per-genre playlists
+      M3U_DIR/Energy/    Peak.m3u8, Mid.m3u8, Chill.m3u8
+      M3U_DIR/Combined/  Peak Afro House.m3u8, Chill Deep House.m3u8, etc.
+      XML_DIR/           rekordbox_library.xml  (all playlists in one file)
+    """
     generate_m3u(dry_run)
     generate_genre_m3u(dry_run)
+    generate_energy_m3u(dry_run)
+    generate_combined_m3u(dry_run)
     generate_rekordbox_xml(dry_run)
     return files

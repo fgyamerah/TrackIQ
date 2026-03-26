@@ -79,6 +79,8 @@ def _init_dirs() -> None:
         config.REJECTED,
         config.M3U_DIR,
         config.GENRE_M3U_DIR,
+        config.ENERGY_M3U_DIR,
+        config.COMBINED_M3U_DIR,
         config.XML_DIR,
         config.LOGS_DIR,
         config.REPORTS_DIR,

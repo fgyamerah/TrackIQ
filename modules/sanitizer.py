@@ -25,7 +25,8 @@ from modules.textlog import log_action
 log = logging.getLogger(__name__)
 
 # Fields processed by the sanitizer (maps our key → mutagen easy tag name)
-_SANITIZE_FIELDS = ["title", "artist", "album", "genre", "comment"]
+# organization = TPUB (publisher/label) in ID3; also cleaned to catch URL watermarks
+_SANITIZE_FIELDS = ["title", "artist", "album", "genre", "comment", "organization"]
 
 # ---------------------------------------------------------------------------
 # Pattern library
@@ -98,6 +99,13 @@ _RE_SYMBOLS = re.compile(r'[™®©℗$€£¥¢]', re.UNICODE)
 # Each entry has a comment explaining the source of the junk.
 _PROMO_PHRASES: List[Tuple[re.Pattern, str]] = [
 
+    # Camelot / Open Key prefix accidentally written into non-key fields.
+    # e.g. "8A - My Song" (title imported from a Camelot-prefixed filename),
+    # or "11B | Track Name" in comment/grouping fields.
+    # Only matches at the very start of the string, followed by a separator,
+    # so standalone titles like "8A Records" are unaffected.
+    (re.compile(r'^(1[0-2]|[1-9])[AB]\s*[-|–_]\s*', re.IGNORECASE), ''),
+
     # "for dj only" / "for djs only" / "for dj use only"
     # Reason: standard watermark text from promo-only distribution pools
     (re.compile(r'\bfor\s+dj(?:\'?s?)?\s+(?:use\s+)?only\b', re.IGNORECASE), ''),
@@ -111,6 +119,12 @@ _PROMO_PHRASES: List[Tuple[re.Pattern, str]] = [
 
     # "zipdj" — ZipDJ.com download-source tag
     (re.compile(r'\bzipdj\b', re.IGNORECASE), ''),
+
+    # "traxcrate" — TraxCrate.com download-source tag
+    (re.compile(r'\btraxcrate\b', re.IGNORECASE), ''),
+
+    # "musicafresca" — MusicaFresca.com source watermark
+    (re.compile(r'\bmusicafresca\b', re.IGNORECASE), ''),
 
     # "beatsource" — Beatsource.com download-source tag
     (re.compile(r'\bbeatsource\b', re.IGNORECASE), ''),
@@ -287,11 +301,12 @@ def _read_tags(path) -> Dict[str, str]:
             return {}
         get = lambda key: (audio.get(key) or [''])[0]
         return {
-            'title':   get('title'),
-            'artist':  get('artist'),
-            'album':   get('album'),
-            'genre':   get('genre'),
-            'comment': get('comment'),
+            'title':        get('title'),
+            'artist':       get('artist'),
+            'album':        get('album'),
+            'genre':        get('genre'),
+            'comment':      get('comment'),
+            'organization': get('organization'),   # TPUB / label
         }
     except Exception as exc:
         log.debug("Could not read tags from %s for sanitization: %s", path, exc)
@@ -308,11 +323,17 @@ def _write_tags(path, fields: Dict[str, str], dry_run: bool) -> bool:
         if audio is None:
             return False
         for field, value in fields.items():
-            if value:
-                try:
+            try:
+                if value:
                     audio[field] = [value]
-                except Exception:
-                    pass  # some formats don't support all easy fields
+                elif field == 'organization':
+                    # Explicit empty means the label was junk — delete the tag
+                    try:
+                        del audio[field]
+                    except KeyError:
+                        pass
+            except Exception:
+                pass  # some formats don't support all easy fields
         audio.save()
         return True
     except Exception as exc:
@@ -351,8 +372,16 @@ def run(files, run_id: int, dry_run: bool = False):
             log_action(f"CLEAN: {change} [{path.name}]")
 
         if not dry_run:
-            # Write back changed fields to the file
-            _write_tags(path, {k: v for k, v in sanitized.items() if v}, dry_run)
+            # Write back changed fields to the file.
+            # organization (label) is included even when cleaned to empty so that
+            # junk watermark labels (e.g. "TraxCrate.com") are cleared from the tag.
+            write_fields = {k: v for k, v in sanitized.items() if v}
+            org_orig    = current_tags.get('organization', '')
+            org_cleaned = sanitized.get('organization', '')
+            if org_orig and not org_cleaned:
+                # Label was fully junk — explicitly clear the tag
+                write_fields['organization'] = ''
+            _write_tags(path, write_fields, dry_run)
 
             # Update DB fields we track
             db_update = {}

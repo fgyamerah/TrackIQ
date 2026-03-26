@@ -30,10 +30,12 @@ UNKNOWN_ROUTE = LIBRARY / "unknown"   # for tracks with too little metadata
 
 DUPLICATES   = MUSIC_ROOT / "duplicates"
 REJECTED     = MUSIC_ROOT / "rejected"
-PLAYLISTS    = MUSIC_ROOT / "playlists"
-M3U_DIR      = PLAYLISTS / "m3u"
-GENRE_M3U_DIR = M3U_DIR / "Genre"   # genre-based M3U playlists go here
-XML_DIR      = PLAYLISTS / "xml"
+PLAYLISTS        = MUSIC_ROOT / "playlists"
+M3U_DIR          = PLAYLISTS / "m3u"
+GENRE_M3U_DIR    = M3U_DIR / "Genre"    # genre-based M3U playlists
+ENERGY_M3U_DIR   = M3U_DIR / "Energy"   # energy-tier M3U playlists (Peak / Mid / Chill)
+COMBINED_M3U_DIR = M3U_DIR / "Combined" # genre+energy combined M3U playlists
+XML_DIR          = PLAYLISTS / "xml"
 LOGS_DIR         = MUSIC_ROOT / "logs"
 DB_PATH          = LOGS_DIR / "processed.db"
 REPORTS_DIR      = LOGS_DIR / "reports"
@@ -98,6 +100,12 @@ BEETS_CONFIG = Path.home() / ".config" / "beets" / "config.yaml"
 # ---------------------------------------------------------------------------
 # Set to False to disable tag sanitization entirely (useful for debugging)
 SANITIZE_TAGS = True
+
+# ---------------------------------------------------------------------------
+# Playlist generation toggles
+# ---------------------------------------------------------------------------
+GENERATE_ENERGY_PLAYLISTS   = True   # Peak / Mid / Chill energy-tier playlists
+GENERATE_COMBINED_PLAYLISTS = True   # Genre+Energy combined playlists (e.g. Peak Afro House)
 
 # ---------------------------------------------------------------------------
 # Pipeline metadata

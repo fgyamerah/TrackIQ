@@ -50,30 +50,115 @@ _JUNK_PATTERNS: list[re.Pattern] = [
     re.compile(r"^0+$"),                                   # all zeros
 ]
 
+# Camelot / Open Key notation  (e.g. 8A, 11B, 3A -, 10B -)
+_CAMELOT_KEY = re.compile(r"^(1[0-2]|[1-9])[AB]\s*[-|_]*\s*$", re.IGNORECASE)
+
+# URL and domain junk
+_URL_PREFIX    = re.compile(r"https?://|www\.", re.IGNORECASE)
+_DOMAIN_ENDING = re.compile(
+    r"\.(com|net|org|fm|dj|co|io)(\s|/|$)", re.IGNORECASE
+)
+
+# Known DJ-pool / source-watermark substrings (lowercase)
+_SOURCE_JUNK_SUBSTRINGS: tuple[str, ...] = (
+    "traxcrate",
+    "fordjonly",
+    "djcity",
+    "zipdj",
+    "musicafresca",
+    "downloaded from",
+    "promo only",
+)
+
+# ---------------------------------------------------------------------------
+# Candidate normalization (applied before junk checks)
+# ---------------------------------------------------------------------------
+_RE_REPEATED_SEP = re.compile(r"[\s\-|_]{2,}")
+_RE_SURROUND_BRACKET = re.compile(r"^[\[\]()\s]+|[\[\]()\s]+$")
+
+
+def _normalize_candidate(value: str) -> str:
+    """
+    Normalize a label candidate string before junk validation.
+
+    - strips leading/trailing whitespace
+    - removes surrounding brackets and parentheses
+    - collapses repeated separators (space, dash, pipe, underscore)
+    - strips leading/trailing punctuation marks
+    """
+    v = value.strip()
+    v = _RE_SURROUND_BRACKET.sub("", v).strip()
+    v = _RE_REPEATED_SEP.sub(" ", v).strip()
+    v = v.strip(".-_|,;:!?")
+    return v.strip()
+
+
+# ---------------------------------------------------------------------------
+# Reason-returning core (used by both is_junk_label and logging helpers)
+# ---------------------------------------------------------------------------
+
+def _junk_reason(value: str) -> "Optional[str]":
+    """
+    Return a human-readable rejection reason if *value* is junk, else None.
+
+    Checks are applied in priority order.  The raw stripped value is used for
+    URL / Camelot / source-watermark checks; the normalized form is used for
+    structural pattern checks.
+    """
+    if not value:
+        return "empty"
+    raw = value.strip()
+    if not raw:
+        return "empty after strip"
+
+    raw_lower = raw.lower()
+
+    # Camelot / musical-key notation — check before normalization so that
+    # trailing separator variants ("8A -") are caught by the regex directly.
+    if _CAMELOT_KEY.match(raw):
+        return "Camelot/musical key"
+
+    # URL or domain watermark
+    if _URL_PREFIX.search(raw_lower):
+        return "URL or domain prefix"
+    if _DOMAIN_ENDING.search(raw_lower):
+        return "domain name"
+
+    # DJ-pool / source watermarks
+    for junk in _SOURCE_JUNK_SUBSTRINGS:
+        if junk in raw_lower:
+            return f"source junk ({junk!r})"
+
+    # Now apply normalization for the remaining structural checks
+    v  = _normalize_candidate(raw)
+    vl = v.lower()
+
+    if not v:
+        return "empty after normalization"
+    if len(v) == 1:
+        return "single character"
+    if vl in _JUNK_EXACT:
+        return "exact junk value"
+    if vl in _GENRE_WORDS:
+        return "genre word"
+    for pat in _JUNK_PATTERNS:
+        if pat.match(vl):
+            return "junk pattern"
+    return None
+
 
 def is_junk_label(value: str) -> bool:
     """
     Return True if value is clearly not a real label name.
 
     Rejects: empty, whitespace, 'unknown', 'n/a', single characters,
-    pure catalog codes, obvious genre words, pure symbol strings.
+    pure catalog codes, obvious genre words, pure symbol strings,
+    Camelot/musical keys, URLs, domain names, and DJ-pool watermarks.
+
+    Normalizes the candidate before structural checks (strips surrounding
+    brackets, collapses repeated separators, removes edge punctuation).
     """
-    if not value:
-        return True
-    v  = value.strip()
-    vl = v.lower()
-    if not v:
-        return True
-    if len(v) == 1:
-        return True
-    if vl in _JUNK_EXACT:
-        return True
-    if vl in _GENRE_WORDS:
-        return True
-    for pat in _JUNK_PATTERNS:
-        if pat.match(vl):
-            return True
-    return False
+    return _junk_reason(value) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -186,10 +271,12 @@ def detect_label(
     # 1. Primary: organization / TPUB
     # ------------------------------------------------------------------
     org = tags["organization"]
-    if org and not is_junk_label(org):
-        return _result(org, org, _SOURCE_EMBEDDED, _CONF_EMBEDDED, "kept")
     if org:
-        notes.append(f"organization tag junk: {org!r}")
+        _reason = _junk_reason(org)
+        if not _reason:
+            return _result(org, org, _SOURCE_EMBEDDED, _CONF_EMBEDDED, "kept")
+        log.debug("Junk label rejected — field=organization  value=%r  reason=%s", org, _reason)
+        notes.append(f"organization tag junk ({_reason}): {org!r}")
 
     # ------------------------------------------------------------------
     # 2. Fallback fields
@@ -208,35 +295,54 @@ def detect_label(
         ("comment",     _CONF_FALLBACK_COMMENT,     "comment"),
     ]:
         val = tags[fld]
-        if val and not is_junk_label(val):
-            notes.append(f"filled from {tag_label} tag")
-            return _result(val, val, _SOURCE_FALLBACK, conf, "filled")
+        if val:
+            _reason = _junk_reason(val)
+            if not _reason:
+                notes.append(f"filled from {tag_label} tag")
+                return _result(val, val, _SOURCE_FALLBACK, conf, "filled")
+            log.debug("Junk label rejected — field=%s  value=%r  reason=%s", fld, val, _reason)
+            notes.append(f"{tag_label} tag junk ({_reason}): {val!r}")
 
     # albumartist — only if it contains a label-indicator word
     aa = tags["albumartist"]
-    if aa and not is_junk_label(aa) and _LABEL_INDICATOR.search(aa):
-        notes.append("filled from albumartist tag (label indicator word present)")
-        return _result(aa, aa, _SOURCE_FALLBACK, _CONF_FALLBACK_ALBUMARTIST, "filled")
+    if aa:
+        _reason = _junk_reason(aa)
+        if not _reason and _LABEL_INDICATOR.search(aa):
+            notes.append("filled from albumartist tag (label indicator word present)")
+            return _result(aa, aa, _SOURCE_FALLBACK, _CONF_FALLBACK_ALBUMARTIST, "filled")
+        if _reason:
+            log.debug("Junk label rejected — field=albumartist  value=%r  reason=%s", aa, _reason)
 
     # album — only if it contains a label-indicator word
     alb = tags["album"]
-    if alb and not is_junk_label(alb) and _LABEL_INDICATOR.search(alb):
-        notes.append("filled from album tag (label indicator word present)")
-        return _result(alb, alb, _SOURCE_FALLBACK, _CONF_FALLBACK_ALBUM, "filled")
+    if alb:
+        _reason = _junk_reason(alb)
+        if not _reason and _LABEL_INDICATOR.search(alb):
+            notes.append("filled from album tag (label indicator word present)")
+            return _result(alb, alb, _SOURCE_FALLBACK, _CONF_FALLBACK_ALBUM, "filled")
+        if _reason:
+            log.debug("Junk label rejected — field=album  value=%r  reason=%s", alb, _reason)
 
     # ------------------------------------------------------------------
     # 3. Filename parsing
     # ------------------------------------------------------------------
     fn_result = parse_label_from_filename(path.stem)
-    if fn_result and not is_junk_label(fn_result.label_candidate):
-        notes.append(f"filename pattern: {fn_result.pattern}")
-        return _result(
-            fn_result.raw_match,
-            fn_result.label_candidate,
-            _SOURCE_FILENAME,
-            fn_result.confidence,
-            "filled",
+    if fn_result:
+        _reason = _junk_reason(fn_result.label_candidate)
+        if not _reason:
+            notes.append(f"filename pattern: {fn_result.pattern}")
+            return _result(
+                fn_result.raw_match,
+                fn_result.label_candidate,
+                _SOURCE_FILENAME,
+                fn_result.confidence,
+                "filled",
+            )
+        log.debug(
+            "Junk label rejected — field=filename  value=%r  reason=%s",
+            fn_result.label_candidate, _reason,
         )
+        notes.append(f"filename candidate junk ({_reason}): {fn_result.label_candidate!r}")
 
     # ------------------------------------------------------------------
     # 4. Unresolved
